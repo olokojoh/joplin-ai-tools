@@ -18,6 +18,9 @@ interface AiMetadata {
 	raw: string;
 }
 
+const DEFAULT_TITLE_SYSTEM_PROMPT = '你是一名知识管理助手，需根据笔记内容生成简洁、具体的中文标题。';
+const DEFAULT_TAG_SYSTEM_PROMPT = '根据笔记主题提炼简洁、不重复的中文标签，标签之间互相独立。';
+
 async function streamChatCompletion(
 	baseUrl: string,
 	apiKey: string,
@@ -317,6 +320,29 @@ function parseAiTitleAndTags(raw: string, fallbackTitle: string, maxTags: number
 	};
 }
 
+function escapeXml(input: string): string {
+	return input
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&apos;');
+}
+
+function wrapInCdata(input: string): string {
+	if (!input) return '<![CDATA[]]>';
+	return `<![CDATA[${input.replace(/]]>/g, ']]]]><![CDATA[>')}]]>`;
+}
+
+function escapeHtml(input: string): string {
+	return input
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#39;');
+}
+
 async function listAllNoteTags(noteId: string): Promise<Array<{ id: string; title: string }>> {
 	const output: Array<{ id: string; title: string }> = [];
 	let page = 1;
@@ -414,13 +440,66 @@ function clampTagLimit(raw: any): number {
 }
 
 function buildSystemMessage(titlePrompt: string, tagPrompt: string, tagLimit: number): string {
-	const parts: string[] = [];
-	if (titlePrompt && titlePrompt.trim()) parts.push(titlePrompt.trim());
-	if (tagPrompt && tagPrompt.trim()) parts.push(tagPrompt.trim());
-	parts.push(
-		`始终输出严格的 JSON 对象 {"title":"...","tags":["..."]}，其中 tags 数组长度不超过 ${tagLimit}，标签需与正文主题高度相关且无多余空白或编号。`
-	);
-	return parts.join('\n');
+	const effectiveTitlePrompt = (titlePrompt || '').trim() || DEFAULT_TITLE_SYSTEM_PROMPT;
+	const effectiveTagPrompt = (tagPrompt || '').trim() || DEFAULT_TAG_SYSTEM_PROMPT;
+	const xmlLines = [
+		'<systemInstructions>',
+		'  <meta>',
+		'    <role>ai-tools</role>',
+		'    <purpose>generate-note-title-and-tags</purpose>',
+		'    <language>zh-CN</language>',
+		'    <version>1.0</version>',
+		'  </meta>',
+		`  <titleGuidance>${wrapInCdata(effectiveTitlePrompt)}</titleGuidance>`,
+		`  <tagGuidance>${wrapInCdata(effectiveTagPrompt)}</tagGuidance>`,
+		'  <output>',
+		'    <format>{"title":"...","tags":["..."]}</format>',
+		`    <tagLimit>${tagLimit}</tagLimit>`,
+		'    <constraints>',
+		'      <item>Do not return anything outside the JSON object.</item>',
+		'      <item>Ensure tags are relevant, deduplicated, and trimmed.</item>',
+		'    </constraints>',
+		'  </output>',
+	'</systemInstructions>',
+	];
+	return xmlLines.join('\n');
+}
+
+function buildUserPrompt(originalTitle: string, body: string): string {
+	return [
+		'<note>',
+		`  <originalTitle>${escapeXml(originalTitle || '（无标题）')}</originalTitle>`,
+		`  <body>${wrapInCdata(body)}</body>`,
+		'</note>',
+	].join('\n');
+}
+
+function buildPromptEditorHtml(titlePrompt: string, tagPrompt: string, tagLimit: number): string {
+	const titleValue = escapeHtml(titlePrompt);
+	const tagValue = escapeHtml(tagPrompt);
+	const limitValue = Number.isFinite(tagLimit) ? tagLimit : 3;
+	return `
+		<style>
+			.ai-tools-form { font-family: sans-serif; padding: 8px 0; }
+			.ai-tools-form label { font-weight: 600; display: block; margin: 12px 0 4px; }
+			.ai-tools-form textarea { width: 100%; min-height: 160px; padding: 8px; box-sizing: border-box; font-family: monospace; }
+			.ai-tools-form input[type="number"] { width: 120px; padding: 6px; }
+			.ai-tools-hint { color: #666; font-size: 12px; margin-top: 4px; }
+		</style>
+		<form name="promptForm" class="ai-tools-form">
+			<label for="titlePrompt">标题系统提示词</label>
+			<textarea id="titlePrompt" name="titlePrompt" spellcheck="false">${titleValue}</textarea>
+			<p class="ai-tools-hint">该提示词将放入 system role，并使用 XML 包裹。</p>
+
+			<label for="tagPrompt">标签系统提示词</label>
+			<textarea id="tagPrompt" name="tagPrompt" spellcheck="false">${tagValue}</textarea>
+			<p class="ai-tools-hint">建议在提示词里说明拆分标签、语义要求等规范。</p>
+
+			<label for="tagLimit">标签数量上限</label>
+			<input id="tagLimit" name="tagLimit" type="number" min="1" max="10" value="${limitValue}" />
+			<p class="ai-tools-hint">支持 1-10 之间的整数，默认为 3。</p>
+		</form>
+	`;
 }
 
 async function removeAllTagsFromNote(noteId: string): Promise<number> {
@@ -457,7 +536,7 @@ joplin.plugins.register({
 				description: 'Your API key for the service',
 			},
 			titleSystemPrompt: {
-				value: '你是一名知识管理助手，需根据笔记内容生成简洁、具体的中文标题。',
+				value: DEFAULT_TITLE_SYSTEM_PROMPT,
 				type: 2,
 				section: 'aiToolsSettings',
 				public: true,
@@ -465,7 +544,7 @@ joplin.plugins.register({
 				description: '可选的系统消息，用于指导模型生成标题。',
 			},
 			tagSystemPrompt: {
-				value: '根据笔记主题提炼简洁、不重复的中文标签，标签之间互相独立。',
+				value: DEFAULT_TAG_SYSTEM_PROMPT,
 				type: 2,
 				section: 'aiToolsSettings',
 				public: true,
@@ -594,7 +673,7 @@ joplin.plugins.register({
 					}
 
 					const truncatedBody = truncateContent(body, 4000);
-					const prompt = `请阅读以下笔记正文，为其生成一个简洁、具体且不超过40个汉字的中文标题，并列出 1-${tagLimit} 个与正文主题高度相关的中文标签。请严格输出 JSON：{"title":"新标题","tags":["标签1","标签2"]}，不要包含额外文本。\n\n笔记原标题：${note.title || '（无标题）'}\n\n笔记正文：\n${truncatedBody}`;
+					const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody);
 
 					const aiRaw = await streamChatCompletion(
 						baseUrl,
@@ -723,7 +802,7 @@ joplin.plugins.register({
 							}
 
 							const truncatedBody = truncateContent(body, 4000);
-							const prompt = `请阅读以下笔记正文，为其生成一个简洁、具体且不超过40个汉字的中文标题，并列出 1-${tagLimit} 个与正文主题高度相关的中文标签。请严格输出 JSON：{"title":"新标题","tags":["标签1","标签2"]}，不要包含额外文本。\n\n笔记原标题：${note.title || '（无标题）'}\n\n笔记正文：\n${truncatedBody}`;
+							const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody);
 
 							try {
 								const aiRaw = await streamChatCompletion(
