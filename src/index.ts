@@ -48,6 +48,88 @@ const DEFAULT_TAG_SYSTEM_PROMPT = [
 	'3. **\u7eaf\u51c0\u68c0\u67e5**\uff1a\u786e\u4fdd\u6bcf\u4e2a\u6807\u7b7e\u90fd\u662f\u539f\u5b50\u6982\u5ff5\uff0c\u4e14\u5f7c\u6b64\u8bed\u4e49\u72ec\u7acb',
 ].join('\n');
 
+const TAG_POOL_STORAGE_KEY = 'tagPoolStorage';
+const TAG_POOL_PREVIEW_KEY = 'tagPoolPreview';
+const TAG_POOL_PROMPT_LIMIT = 200;
+let isSyncingTagPoolPreview = false;
+
+function normaliseTagPoolInput(tags: string[]): string[] {
+	const unique = new Set<string>();
+	for (const tag of tags) {
+		const cleaned = typeof tag === 'string' ? tag.trim() : '';
+		if (!cleaned) continue;
+		unique.add(cleaned);
+	}
+	return Array.from(unique).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN', { sensitivity: 'base' }));
+}
+
+async function loadTagPool(): Promise<string[]> {
+	const raw = await joplin.settings.value(TAG_POOL_STORAGE_KEY);
+	if (typeof raw !== 'string' || !raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed)) {
+			return normaliseTagPoolInput(parsed);
+		}
+	} catch (error) {
+		console.warn('[AI Tools] Failed to parse stored tag pool, rebuilding...', error);
+	}
+	return [];
+}
+
+async function ensureTagPool(): Promise<string[]> {
+	const existing = await loadTagPool();
+	if (existing.length) {
+		await joplin.settings.setValue(TAG_POOL_PREVIEW_KEY, existing.join('\n'));
+		return existing;
+	}
+	return refreshTagPoolFromJoplin();
+}
+
+async function saveTagPool(tags: string[]): Promise<void> {
+	const normalised = normaliseTagPoolInput(tags);
+	await joplin.settings.setValue(TAG_POOL_STORAGE_KEY, JSON.stringify(normalised));
+	await joplin.settings.setValue(TAG_POOL_PREVIEW_KEY, normalised.join('\n'));
+}
+
+async function refreshTagPoolFromJoplin(): Promise<string[]> {
+	const collected = new Set<string>();
+	const limit = 50;
+	let page = 1;
+
+	while (true) {
+		const result = await joplin.data.get(['notes'], {
+			fields: ['id'],
+			limit,
+			page,
+		});
+
+		const notes = result.items as Array<{ id?: string }> | undefined;
+		if (Array.isArray(notes)) {
+			for (const note of notes) {
+				if (!note || !note.id) continue;
+				const tags = await listAllNoteTags(note.id);
+				for (const tag of tags) {
+					const cleaned = typeof tag.title === 'string' ? tag.title.trim() : '';
+					if (cleaned) collected.add(cleaned);
+				}
+			}
+		}
+
+		if (!result.has_more) break;
+		page += 1;
+	}
+
+	const tagPool = normaliseTagPoolInput(Array.from(collected));
+	await saveTagPool(tagPool);
+	return tagPool;
+}
+
+function prepareTagPoolForPrompt(tagPool: string[]): string[] {
+	if (!Array.isArray(tagPool) || !tagPool.length) return [];
+	return tagPool.slice(0, TAG_POOL_PROMPT_LIMIT);
+}
+
 async function streamChatCompletion(
 	baseUrl: string,
 	apiKey: string,
@@ -501,10 +583,11 @@ function clampTagLimit(raw: any): number {
 	return Math.max(1, Math.min(10, Math.floor(parsed)));
 }
 
-function buildSystemMessage(titlePrompt: string, tagPrompt: string, tagLimit: number): string {
+function buildSystemMessage(titlePrompt: string, tagPrompt: string, tagLimit: number, tagPool: string[]): string {
 	const effectiveTitlePrompt = normalisePromptInput(titlePrompt) || DEFAULT_TITLE_SYSTEM_PROMPT;
 	const effectiveTagPrompt = normalisePromptInput(tagPrompt) || DEFAULT_TAG_SYSTEM_PROMPT;
-	const xmlLines = [
+	const limitedPool = prepareTagPoolForPrompt(tagPool);
+	const xmlLines: string[] = [
 		'<systemInstructions>',
 		'  <meta>',
 		'    <role>ai-tools</role>',
@@ -514,6 +597,18 @@ function buildSystemMessage(titlePrompt: string, tagPrompt: string, tagLimit: nu
 		'  </meta>',
 		`  <titleGuidance>${wrapInCdata(effectiveTitlePrompt)}</titleGuidance>`,
 		`  <tagGuidance>${wrapInCdata(effectiveTagPrompt)}</tagGuidance>`,
+		'  <reusePolicy>',
+		'    <item>优先从标签池中选择语义匹配的标签；仅在确无合适选项时创建新标签。</item>',
+		'  </reusePolicy>',
+	];
+	if (limitedPool.length) {
+		xmlLines.push('  <tagPool>');
+		for (const tag of limitedPool) {
+			xmlLines.push(`    <tag>${escapeXml(tag)}</tag>`);
+		}
+		xmlLines.push('  </tagPool>');
+	}
+	xmlLines.push(
 		'  <output>',
 		'    <format>{"title":"...","tags":["..."]}</format>',
 		`    <tagLimit>${tagLimit}</tagLimit>`,
@@ -523,17 +618,28 @@ function buildSystemMessage(titlePrompt: string, tagPrompt: string, tagLimit: nu
 		'    </constraints>',
 		'  </output>',
 	'</systemInstructions>',
-	];
+	);
 	return xmlLines.join('\n');
 }
 
-function buildUserPrompt(originalTitle: string, body: string): string {
-	return [
+function buildUserPrompt(originalTitle: string, body: string, tagPool: string[]): string {
+	const limitedPool = prepareTagPoolForPrompt(tagPool);
+	const lines = [
 		'<note>',
 		`  <originalTitle>${escapeXml(originalTitle || '（无标题）')}</originalTitle>`,
 		`  <body>${wrapInCdata(body)}</body>`,
-		'</note>',
-	].join('\n');
+	];
+
+	if (limitedPool.length) {
+		lines.push('  <tagPoolSnapshot>');
+		for (const tag of limitedPool) {
+			lines.push(`    <tag>${escapeXml(tag)}</tag>`);
+		}
+		lines.push('  </tagPoolSnapshot>');
+	}
+
+	lines.push('</note>');
+	return lines.join('\n');
 }
 
 function buildPromptEditorHtml(titlePrompt: string, tagPrompt: string, tagLimit: number): string {
@@ -596,6 +702,30 @@ function buildPromptEditorHtml(titlePrompt: string, tagPrompt: string, tagLimit:
 		</script>
 	`;
 }
+
+function buildTagPoolViewerHtml(tagPool: string[]): string {
+	const safeTags = Array.isArray(tagPool) ? tagPool : [];
+	const listItems = safeTags.map(tag => `<li>${escapeHtml(tag)}</li>`).join('');
+	const summary = `共 ${safeTags.length} 个标签`;
+	return `
+		<style>
+			body { margin: 0; padding: 16px; font-family: sans-serif; min-width: 480px; max-width: 560px; }
+			h1 { font-size: 18px; margin: 0 0 12px; }
+			.tag-pool-summary { color: #555; margin-bottom: 12px; }
+			.tag-pool-container { max-height: 400px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 12px; background: #fafafa; }
+			.tag-pool-container ul { list-style: none; margin: 0; padding: 0; }
+			.tag-pool-container li { padding: 4px 0; border-bottom: 1px solid #eee; font-family: monospace; }
+			.tag-pool-container li:last-child { border-bottom: none; }
+		</style>
+		<div>
+			<h1>标签池</h1>
+			<p class="tag-pool-summary">${summary}</p>
+			<div class="tag-pool-container">
+				<ul>${listItems || '<li>暂无标签</li>'}</ul>
+			</div>
+		</div>
+	`;
+}
 async function removeAllTagsFromNote(noteId: string): Promise<number> {
 	const existing = await listAllNoteTags(noteId);
 	for (const tag of existing) {
@@ -653,7 +783,40 @@ joplin.plugins.register({
 				label: '\u6807\u7b7e\u6570\u91cf\u4e0a\u9650',
 				description: '\u751f\u6210\u6807\u7b7e\u7684\u6570\u91cf\uff0c\u8303\u56f4 1-10\u3002',
 			},
+			tagPoolPreview: {
+				value: '',
+				type: SettingItemType.String,
+				section: 'aiToolsSettings',
+				public: true,
+				advanced: true,
+				label: '\u6807\u7b7e\u6c60\u9605\u89c8\uff08\u53ea\u8bfb\uff09',
+				description: '\u7531\u63d2\u4ef6\u81ea\u52a8\u7ef4\u62a4\uff0c\u53ea\u4f9b\u67e5\u770b\u5f53\u524d\u6807\u7b7e\u6c60\u548c\u4f8b\u3002',
+			},
+			tagPoolStorage: {
+				value: '[]',
+				type: SettingItemType.String,
+				section: 'aiToolsSettings',
+				public: false,
+				label: 'Tag Pool Storage',
+				description: 'Internal storage for tag pool state.',
+			},
 		
+		});
+
+		await ensureTagPool();
+
+		await joplin.settings.onChange(async (event: { keys?: string[] }) => {
+			if (!event || !Array.isArray(event.keys)) return;
+			if (!event.keys.includes(TAG_POOL_PREVIEW_KEY)) return;
+			if (isSyncingTagPoolPreview) return;
+
+			isSyncingTagPoolPreview = true;
+			try {
+				const tags = await loadTagPool();
+				await joplin.settings.setValue(TAG_POOL_PREVIEW_KEY, tags.join('\n'));
+			} finally {
+				isSyncingTagPoolPreview = false;
+			}
 		});
 		const promptEditorDialogId = await joplin.views.dialogs.create('aiPromptEditor');
 		await joplin.views.dialogs.setButtons(promptEditorDialogId, [
@@ -661,6 +824,12 @@ joplin.plugins.register({
 			{ id: 'cancel', title: '\u53d6\u6d88' },
 		]);
 		await joplin.views.dialogs.setFitToContent(promptEditorDialogId, true);
+
+		const tagPoolDialogId = await joplin.views.dialogs.create('aiTagPoolViewer');
+		await joplin.views.dialogs.setButtons(tagPoolDialogId, [
+			{ id: 'close', title: '\u5173\u95ed' },
+		]);
+		await joplin.views.dialogs.setFitToContent(tagPoolDialogId, true);
 
 		await joplin.commands.register({
 			name: 'aiEditPrompts',
@@ -697,6 +866,23 @@ joplin.plugins.register({
 				} catch (error) {
 					console.error('AI Prompt Editor error:', error);
 					await joplin.views.dialogs.showMessageBox(`Error: ${error.message}`);
+				}
+			},
+		});
+
+		await joplin.commands.register({
+			name: 'aiShowTagPool',
+			label: 'AI \u67e5\u770b\u6807\u7b7e\u6c60',
+			iconName: 'fas fa-tags',
+			execute: async () => {
+				try {
+					const tagPool = await refreshTagPoolFromJoplin();
+					const html = buildTagPoolViewerHtml(tagPool);
+					await joplin.views.dialogs.setHtml(tagPoolDialogId, html);
+					await joplin.views.dialogs.open(tagPoolDialogId);
+				} catch (error) {
+					console.error('AI Tag Pool Viewer error:', error);
+					await joplin.views.dialogs.showMessageBox(`Error: ${error instanceof Error ? error.message : error}`);
 				}
 			},
 		});
@@ -804,7 +990,8 @@ joplin.plugins.register({
 					const tagSystemPrompt = String(await joplin.settings.value('tagSystemPrompt') || '');
 					const tagLimitSetting = await joplin.settings.value('tagLimit');
 					const tagLimit = clampTagLimit(tagLimitSetting);
-					const systemMessage = buildSystemMessage(titleSystemPrompt, tagSystemPrompt, tagLimit);
+					const tagPool = await ensureTagPool();
+					const systemMessage = buildSystemMessage(titleSystemPrompt, tagSystemPrompt, tagLimit, tagPool);
 
 					const body = typeof note.body === 'string' ? note.body : '';
 					if (!body.trim()) {
@@ -813,7 +1000,7 @@ joplin.plugins.register({
 					}
 
 					const truncatedBody = truncateContent(body, 4000);
-					const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody);
+					const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody, tagPool);
 
 					const aiRaw = await streamChatCompletion(
 						baseUrl,
@@ -843,6 +1030,9 @@ joplin.plugins.register({
 					let tagStats = { added: 0, removed: 0, final: [] as string[] };
 					if (shouldUpdateTags) {
 						tagStats = await replaceNoteTags(note.id, aiMetadata.tags);
+						if (tagStats.added || tagStats.removed) {
+							await refreshTagPoolFromJoplin();
+						}
 					}
 
 					const changes: string[] = [];
@@ -880,6 +1070,9 @@ joplin.plugins.register({
 					}
 
 					const removed = await removeAllTagsFromNote(note.id);
+					if (removed > 0) {
+						await refreshTagPoolFromJoplin();
+					}
 					await joplin.views.dialogs.showToast({
 						message: removed ? `已移除当前笔记的 ${removed} 个标签。` : '当前笔记没有可移除的标签。',
 						type: ToastType.Info,
@@ -910,7 +1103,8 @@ joplin.plugins.register({
 					const tagSystemPrompt = String(await joplin.settings.value('tagSystemPrompt') || '');
 					const tagLimitSetting = await joplin.settings.value('tagLimit');
 					const tagLimit = clampTagLimit(tagLimitSetting);
-					const systemMessage = buildSystemMessage(titleSystemPrompt, tagSystemPrompt, tagLimit);
+					const initialTagPool = await ensureTagPool();
+					const workingTagPool = new Set(initialTagPool);
 
 					const limit = 20;
 					let page = 1;
@@ -920,6 +1114,7 @@ joplin.plugins.register({
 					let tagUpdates = 0;
 					let tagsAddedTotal = 0;
 					let tagsRemovedTotal = 0;
+					let tagPoolDirty = false;
 					const errors: string[] = [];
 					const skipIds: string[] = [];
 
@@ -942,7 +1137,9 @@ joplin.plugins.register({
 							}
 
 							const truncatedBody = truncateContent(body, 4000);
-							const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody);
+							const tagPoolSnapshot = Array.from(workingTagPool);
+							const systemMessage = buildSystemMessage(titleSystemPrompt, tagSystemPrompt, tagLimit, tagPoolSnapshot);
+							const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody, tagPoolSnapshot);
 
 							try {
 								const aiRaw = await streamChatCompletion(
@@ -976,8 +1173,14 @@ joplin.plugins.register({
 								let tagsChanged = false;
 								if (shouldUpdateTags) {
 									const tagStats = await replaceNoteTags(note.id, aiMetadata.tags);
+									if (Array.isArray(tagStats.final) && tagStats.final.length) {
+										for (const tag of tagStats.final) {
+											workingTagPool.add(tag);
+										}
+									}
 									if (tagStats.added || tagStats.removed) {
 										tagsChanged = true;
+										tagPoolDirty = true;
 									}
 									if (tagStats.added) tagsAddedTotal += tagStats.added;
 									if (tagStats.removed) tagsRemovedTotal += tagStats.removed;
@@ -999,6 +1202,12 @@ joplin.plugins.register({
 
 						if (!result.has_more) break;
 						page += 1;
+					}
+
+					if (tagPoolDirty) {
+						await refreshTagPoolFromJoplin();
+					} else {
+						await ensureTagPool();
 					}
 
 					const summary = [
@@ -1065,6 +1274,12 @@ joplin.plugins.register({
 
 					console.info(`AI clear tags summary: processed ${processed}, cleared ${clearedNotes}, tags removed ${removedTags}`);
 
+					if (removedTags > 0) {
+						await refreshTagPoolFromJoplin();
+					} else {
+						await ensureTagPool();
+					}
+
 					await joplin.views.dialogs.showToast({
 						message: removedTags
 							? `已从 ${clearedNotes} 篇笔记移除 ${removedTags} 个标签。`
@@ -1114,6 +1329,9 @@ joplin.plugins.register({
 				commandName: 'aiEditPrompts',
 			},
 			{
+				commandName: 'aiShowTagPool',
+			},
+			{
 				commandName: 'aiGenerateTitleForCurrentNote',
 			},
 			{
@@ -1131,4 +1349,3 @@ joplin.plugins.register({
 		console.info('AI Tools plugin started!');
 	},
 });
-
