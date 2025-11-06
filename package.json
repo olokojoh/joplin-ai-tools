@@ -1,6 +1,6 @@
 {
   "name": "joplin-plugin-ai-tools",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "scripts": {
     "build": "webpack --env joplin-plugin-config=buildMain && webpack --env joplin-plugin-config=buildExtraScripts",
     "dist": "npm run build && webpack --env joplin-plugin-config=createArchive",

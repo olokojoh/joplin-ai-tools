@@ -734,6 +734,144 @@ async function removeAllTagsFromNote(noteId: string): Promise<number> {
 	return existing.length;
 }
 
+type NotebookInfo = {
+	id: string;
+	title?: string;
+};
+
+async function resolveActiveNotebook(): Promise<NotebookInfo | null> {
+	const ensureFolder = async (folderId: string | undefined, fallbackTitle?: string): Promise<NotebookInfo | null> => {
+		if (typeof folderId !== 'string' || !folderId) return null;
+		try {
+			const folder = await joplin.data.get(['folders', folderId], {
+				fields: ['id', 'title'],
+			}) as { id?: string; title?: string };
+			if (folder && typeof folder.id === 'string' && folder.id) {
+				return {
+					id: folder.id,
+					title: folder.title ?? fallbackTitle,
+				};
+			}
+		} catch (error) {
+			console.warn(`[AI Tools] Failed to verify folder ${folderId}`, error);
+		}
+		return null;
+	};
+
+	try {
+		const selectedFolder = await joplin.workspace.selectedFolder();
+		const resolved = await ensureFolder(selectedFolder?.id, selectedFolder?.title);
+		if (resolved) return resolved;
+	} catch (error) {
+		console.warn('[AI Tools] Failed to read selected folder', error);
+	}
+
+	try {
+		const note = await joplin.workspace.selectedNote();
+		if (note) {
+			const resolved = await ensureFolder(note.parent_id);
+			if (resolved) return resolved;
+		}
+	} catch (error) {
+		console.warn('[AI Tools] Failed to read selected note', error);
+	}
+
+	return null;
+}
+
+async function collectNotebookFolderIds(rootId: string): Promise<string[]> {
+	const collected: string[] = [];
+	const stack: string[] = [];
+	const seen = new Set<string>();
+
+	try {
+		const root = await joplin.data.get(['folders', rootId], {
+			fields: ['id'],
+		}) as { id?: string };
+		if (!root || typeof root.id !== 'string') {
+			return [];
+		}
+		stack.push(root.id);
+	} catch (error) {
+		console.warn(`[AI Tools] Failed to load root folder ${rootId}`, error);
+		return [];
+	}
+
+	while (stack.length) {
+		const current = stack.pop() as string;
+		if (!current || seen.has(current)) continue;
+		seen.add(current);
+		collected.push(current);
+
+		let page = 1;
+		while (true) {
+			let result: { items?: Array<{ id?: string }>; has_more?: boolean } | null = null;
+			try {
+				result = await joplin.data.get(['folders', current, 'folders'], {
+					fields: ['id'],
+					limit: 50,
+					page,
+				}) as { items?: Array<{ id?: string }>; has_more?: boolean };
+			} catch (error) {
+				console.warn(`[AI Tools] Failed to load sub-folders for ${current}`, error);
+				break;
+			}
+
+			const children = result?.items as Array<{ id?: string }> | undefined;
+			if (Array.isArray(children)) {
+				for (const child of children) {
+					if (child && typeof child.id === 'string' && child.id && !seen.has(child.id)) {
+						stack.push(child.id);
+					}
+				}
+			}
+
+			if (!result?.has_more) break;
+			page += 1;
+		}
+	}
+
+	return collected;
+}
+
+type NoteIteratorHandler = (note: { [key: string]: any }) => Promise<void> | void;
+
+async function forEachNoteInNotebook(
+	notebookId: string,
+	fields: string[],
+	limit: number,
+	handler: NoteIteratorHandler,
+): Promise<void> {
+	const folderIds = await collectNotebookFolderIds(notebookId);
+	if (!folderIds.length) return;
+	for (const folderId of folderIds) {
+		let page = 1;
+		while (true) {
+			let result: { items?: Array<{ [key: string]: any }>; has_more?: boolean } | null = null;
+			try {
+				result = await joplin.data.get(['folders', folderId, 'notes'], {
+					fields,
+					limit,
+					page,
+				}) as { items?: Array<{ [key: string]: any }>; has_more?: boolean };
+			} catch (error) {
+				console.warn(`[AI Tools] Failed to load notes for folder ${folderId}`, error);
+				break;
+			}
+
+			const notes = result?.items as Array<{ [key: string]: any }> | undefined;
+			if (Array.isArray(notes) && notes.length) {
+				for (const note of notes) {
+					await handler(note);
+				}
+			}
+
+			if (!result?.has_more) break;
+			page += 1;
+		}
+	}
+}
+
 joplin.plugins.register({
 	onStart: async function() {
 		await joplin.settings.registerSection('aiToolsSettings', {
@@ -1086,6 +1224,213 @@ joplin.plugins.register({
 		});
 
 		await joplin.commands.register({
+			name: 'aiGenerateTitlesForCurrentNotebook',
+			label: 'AI Generate Titles for Current Notebook',
+			iconName: 'fas fa-book-open',
+			execute: async () => {
+				try {
+					const notebook = await resolveActiveNotebook();
+					if (!notebook) {
+						await joplin.views.dialogs.showMessageBox('请先选择一个笔记或笔记本。');
+						return;
+					}
+
+					const baseUrl = await joplin.settings.value('baseUrl');
+					const apiKey = await joplin.settings.value('apiKey');
+
+					if (!apiKey || apiKey.trim() === '') {
+						await joplin.views.dialogs.showMessageBox('Please configure your API Key in settings first.');
+						return;
+					}
+
+					const titleSystemPrompt = String(await joplin.settings.value('titleSystemPrompt') || '');
+					const tagSystemPrompt = String(await joplin.settings.value('tagSystemPrompt') || '');
+					const tagLimitSetting = await joplin.settings.value('tagLimit');
+					const tagLimit = clampTagLimit(tagLimitSetting);
+					const initialTagPool = await ensureTagPool();
+					const workingTagPool = new Set(initialTagPool);
+
+					const limit = 20;
+					let processed = 0;
+					let updated = 0;
+					let titlesUpdated = 0;
+					let tagUpdates = 0;
+					let tagsAddedTotal = 0;
+					let tagsRemovedTotal = 0;
+					let tagPoolDirty = false;
+					const errors: string[] = [];
+					const skipIds: string[] = [];
+
+					await forEachNoteInNotebook(
+						notebook.id,
+						['id', 'title', 'body'],
+						limit,
+						async (note) => {
+							if (!note || typeof note.id !== 'string') return;
+							processed++;
+							const body = typeof note.body === 'string' ? note.body : '';
+							if (!body.trim()) {
+								skipIds.push(note.id);
+								return;
+							}
+
+							const truncatedBody = truncateContent(body, 4000);
+							const tagPoolSnapshot = Array.from(workingTagPool);
+							const systemMessage = buildSystemMessage(titleSystemPrompt, tagSystemPrompt, tagLimit, tagPoolSnapshot);
+							const prompt = buildUserPrompt(note.title || '（无标题）', truncatedBody, tagPoolSnapshot);
+
+							try {
+								const aiRaw = await streamChatCompletion(
+									baseUrl,
+									apiKey,
+									prompt,
+									undefined,
+									{
+										stream: false,
+										systemMessage,
+									}
+								);
+								const aiMetadata = parseAiTitleAndTags(aiRaw, note.title, tagLimit);
+								const shouldUpdateTitle = !!aiMetadata.title && aiMetadata.title !== note.title;
+								const shouldUpdateTags = aiMetadata.tags.length > 0;
+
+								if (!shouldUpdateTitle && !shouldUpdateTags) {
+									skipIds.push(note.id);
+									return;
+								}
+
+								let titleUpdated = false;
+								if (shouldUpdateTitle) {
+									await joplin.data.put(['notes', note.id], null, {
+										title: aiMetadata.title,
+									});
+									titleUpdated = true;
+									updated++;
+								}
+
+								let tagsChanged = false;
+								if (shouldUpdateTags) {
+									const tagStats = await replaceNoteTags(note.id, aiMetadata.tags);
+									if (Array.isArray(tagStats.final) && tagStats.final.length) {
+										for (const tag of tagStats.final) {
+											workingTagPool.add(tag);
+										}
+									}
+									if (tagStats.added || tagStats.removed) {
+										tagsChanged = true;
+										tagPoolDirty = true;
+									}
+									if (tagStats.added) tagsAddedTotal += tagStats.added;
+									if (tagStats.removed) tagsRemovedTotal += tagStats.removed;
+									if (tagStats.added || tagStats.removed) tagUpdates += 1;
+								}
+
+								if (!titleUpdated && !tagsChanged) {
+									skipIds.push(note.id);
+								} else {
+									if (!titleUpdated) updated++;
+									if (titleUpdated) titlesUpdated += 1;
+								}
+							} catch (error) {
+								const message = error instanceof Error ? error.message : `${error}`;
+								errors.push(`${note.id}: ${message}`);
+								console.error(`Failed to update title for note ${note.id}:`, error);
+							}
+						}
+					);
+
+					if (tagPoolDirty) {
+						await refreshTagPoolFromJoplin();
+					} else {
+						await ensureTagPool();
+					}
+
+					const summary = [
+						`Notebook: ${notebook.title || notebook.id}`,
+						`Processed: ${processed}`,
+						`Updated Notes: ${updated}`,
+						`Titles Updated: ${titlesUpdated}`,
+						`Tag Adjustments: ${tagUpdates} (+${tagsAddedTotal}/-${tagsRemovedTotal})`,
+						`Skipped: ${skipIds.length}`,
+						errors.length ? `Errors: ${errors.length}` : '',
+					].filter(Boolean).join(', ');
+
+					console.info(`AI notebook title generation summary: ${summary}`);
+
+					const notebookDisplay = notebook.title ? `笔记本「${notebook.title}」` : '当前笔记本';
+					const toastMessage = errors.length
+						? `${notebookDisplay}批量更新完成：标题 ${titlesUpdated}，标签 ${tagUpdates}，跳过 ${skipIds.length}，错误 ${errors.length}`
+						: `${notebookDisplay}批量更新完成：标题 ${titlesUpdated}，标签 ${tagUpdates}，跳过 ${skipIds.length}`;
+
+					await joplin.views.dialogs.showToast({
+						message: toastMessage,
+						type: errors.length ? ToastType.Info : ToastType.Success,
+						duration: 8000,
+					});
+				} catch (error) {
+					console.error('AI Generate Titles (current notebook) error:', error);
+					await joplin.views.dialogs.showMessageBox(`Error: ${error.message}`);
+				}
+			},
+		});
+
+		await joplin.commands.register({
+			name: 'aiClearTagsForCurrentNotebook',
+			label: 'AI Clear Tags for Current Notebook',
+			iconName: 'fas fa-book',
+			execute: async () => {
+				try {
+					const notebook = await resolveActiveNotebook();
+					if (!notebook) {
+						await joplin.views.dialogs.showMessageBox('请先选择一个笔记或笔记本。');
+						return;
+					}
+
+					const limit = 50;
+					let processed = 0;
+					let clearedNotes = 0;
+					let removedTags = 0;
+
+					await forEachNoteInNotebook(
+						notebook.id,
+						['id', 'title'],
+						limit,
+						async (note) => {
+							if (!note || typeof note.id !== 'string') return;
+							processed++;
+							const removed = await removeAllTagsFromNote(note.id);
+							if (removed > 0) {
+								clearedNotes++;
+								removedTags += removed;
+							}
+						}
+					);
+
+					console.info(`AI notebook clear tags summary: notebook=${notebook.title || notebook.id}, processed=${processed}, cleared=${clearedNotes}, tagsRemoved=${removedTags}`);
+
+					if (removedTags > 0) {
+						await refreshTagPoolFromJoplin();
+					} else {
+						await ensureTagPool();
+					}
+
+					const notebookDisplay = notebook.title ? `笔记本「${notebook.title}」` : '当前笔记本';
+
+					await joplin.views.dialogs.showToast({
+						message: removedTags
+							? `已从${notebookDisplay}的 ${clearedNotes} 篇笔记移除 ${removedTags} 个标签。`
+							: `${notebookDisplay}中的所有笔记均无可移除的标签。`,
+						type: removedTags ? ToastType.Success : ToastType.Info,
+						duration: 6000,
+					});
+				} catch (error) {
+					console.error('AI Clear Tags (current notebook) error:', error);
+					await joplin.views.dialogs.showMessageBox(`Error: ${error.message}`);
+				}
+			},
+		});
+
+		await joplin.commands.register({
 			name: 'aiGenerateTitlesForAllNotes',
 			label: 'AI Generate Titles for All Notes',
 			iconName: 'fas fa-clipboard-list',
@@ -1313,6 +1658,18 @@ joplin.plugins.register({
 		);
 
 		await joplin.views.toolbarButtons.create(
+			'aiGenerateTitlesNotebookButton',
+			'aiGenerateTitlesForCurrentNotebook',
+			ToolbarButtonLocation.NoteToolbar
+		);
+
+		await joplin.views.toolbarButtons.create(
+			'aiClearTagsNotebookButton',
+			'aiClearTagsForCurrentNotebook',
+			ToolbarButtonLocation.NoteToolbar
+		);
+
+		await joplin.views.toolbarButtons.create(
 			'aiGenerateTitlesButton',
 			'aiGenerateTitlesForAllNotes',
 			ToolbarButtonLocation.NoteToolbar
@@ -1336,6 +1693,12 @@ joplin.plugins.register({
 			},
 			{
 				commandName: 'aiClearTagsForCurrentNote',
+			},
+			{
+				commandName: 'aiGenerateTitlesForCurrentNotebook',
+			},
+			{
+				commandName: 'aiClearTagsForCurrentNotebook',
 			},
 			{
 				commandName: 'aiGenerateTitlesForAllNotes',
