@@ -1,6 +1,6 @@
 {
 	"manifest_version": 1,
-	"id": "com.wujieai.tools",
+	"id": "com.qaqqqqaq.tools",
 	"type": "plugin",
 	"main": "index.js",
 	"app_min_version": "3.3",

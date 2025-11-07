@@ -15,5 +15,9 @@
 	"screenshots": [],
 	"icons": {},
 	"promo_tile": {},
-	"platforms": ["desktop"]
+	"platforms": [
+		"desktop"
+	],
+	"_publish_hash": "sha256:55fc8cb18bae4e0a4568b4605d888799d515ce88d3550df2adc7c136ddf99be2",
+	"_publish_commit": "master:d784705b44ed9c8911b3eba5121d374cfe6cfc7e"
 }
